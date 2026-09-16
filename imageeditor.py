@@ -107,11 +107,38 @@ def straighten_and_pad(image_path, final_output_path):
     print(f"[+] Success! Final padded image saved to: {final_output_path}")
     return True
 
+
+def process_document(input_file, final_output_file):
+    """
+    Bridge function: The camera GUI calls this function.
+    It automatically handles the temporary files and runs your pipeline.
+    """
+    print(f"\n--- Starting Vision Pipeline for {input_file} ---")
+    temp_file = "temp_nobg.png"
+    
+    try:
+        # Step 1: Run your background removal
+        remove_background(input_file, temp_file)
+        
+        # Step 2: Run your math, rotation, and padding
+        success = straighten_and_pad(temp_file, final_output_file)
+        
+        # Step 3: Clean up the temporary file so it doesn't clutter your folder
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+            print("[7] Temporary files cleaned up.")
+            
+        return success
+        
+    except Exception as e:
+        print(f"[-] Fatal error in vision pipeline: {e}")
+        return False
+
 # ==========================================
 # MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    RAW_IMAGE = "testingoutcomes/raw/20260916_180002.jpg"    
+    RAW_IMAGE = "test_capture_2.png"    
     TEMP_IMAGE = "testingoutcomes/raw/temp_nobg.png"         
     FINAL_IMAGE = "testingoutcomes/processed/final_padded.jpg"     
     
