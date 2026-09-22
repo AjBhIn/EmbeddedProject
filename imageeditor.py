@@ -1,149 +1,152 @@
+"""
+DocuNode Vision Pipeline Module (imageeditor.py)
+------------------------------------------------
+Handles edge-computed perspective scanning steps:
+1. AI Background Removal (rembg / u2netp model)
+2. Contour & Corner Detection (OpenCV)
+3. Corner Sorting (Sum and Difference Method)
+4. Perspective Transformation (Warp Matrix)
+5. Landscape Rotation & 100px Alpha Padding
+"""
+
 import cv2
 import numpy as np
+from PIL import Image
 from rembg import remove, new_session
-import os
 
-def remove_background(input_path, output_path):
-    print(f"[1] Loading AI to remove background from {input_path}...")
-    session = new_session("u2netp")
-    
-    with open(input_path, 'rb') as i:
-        input_data = i.read()
-        
-    print("[2] Processing image...")
-    output_data = remove(input_data, session=session)
-    
-    with open(output_path, 'wb') as o:
-        o.write(output_data)
-    print(f"[3] Background removed! Saved temporary file to: {output_path}")
+# Global session cache to avoid re-loading the ONNX model into memory on every scan
+_REMBG_SESSION = None
 
-def order_points(pts):
+def get_rembg_session():
+    """Lazily initializes and caches the u2netp lightweight model session."""
+    global _REMBG_SESSION
+    if _REMBG_SESSION is None:
+        # u2netp is optimized for low-power edge devices like Raspberry Pi
+        _REMBG_SESSION = new_session(model_name="u2netp")
+    return _REMBG_SESSION
+
+def preload_engine():
     """
-    Bulletproof mathematical corner sorting.
+    Warms up the numba JIT compiler and rembg model session in memory.
+    Call this on application startup in a background thread.
     """
-    rect = np.zeros((4, 2), dtype="float32")
-    
-    # Sum of X and Y: Smallest is Top-Left, Largest is Bottom-Right
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    
-    # Difference of Y minus X: Smallest is Top-Right, Largest is Bottom-Left
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    
-    return rect
-
-def straighten_and_pad(image_path, final_output_path):
-    print("[4] Pinning corners and flattening the card...")
-    
-    # Load image. IMREAD_UNCHANGED ensures we capture the alpha (transparency) channel if it exists.
-    img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
-    
-    # 1. BULLETPROOF MASK GENERATION
-    if img.shape[2] == 4:
-        # It's a PNG with transparency. Use the alpha channel as a pure mask.
-        _, mask = cv2.threshold(img[:, :, 3], 200, 255, cv2.THRESH_BINARY)
-        # Convert image to standard BGR for later processing
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    else:
-        # It's a JPG without transparency. Assume black background.
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, mask = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
-        img_bgr = img
-    
-    # 2. Find the card's exact boundaries
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        print("[-] Error: No object found in image.")
-        return False
-        
-    c = max(contours, key=cv2.contourArea)
-    
-    # 3. Calculate mathematically perfect corners of the card
-    rect = cv2.minAreaRect(c)
-    box = cv2.boxPoints(rect)
-    box = np.int32(box)
-    
-    # Order the corners strictly (Top-Left, Top-Right, Bottom-Right, Bottom-Left)
-    ordered_pts = order_points(box.astype("float32"))
-    (tl, tr, br, bl) = ordered_pts
-    
-    # 4. Measure the exact width and height in pixels
-    widthA = np.linalg.norm(br - bl)
-    widthB = np.linalg.norm(tr - tl)
-    maxWidth = max(int(widthA), int(widthB))
-    
-    heightA = np.linalg.norm(tr - br)
-    heightB = np.linalg.norm(tl - bl)
-    maxHeight = max(int(heightA), int(heightB))
-    
-    # Create the destination template (a perfectly flat rectangle)
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype="float32")
-        
-    # 5. Warp the raw image to completely fill the flat rectangle, destroying all background
-    M = cv2.getPerspectiveTransform(ordered_pts, dst)
-    flat_img = cv2.warpPerspective(img_bgr, M, (maxWidth, maxHeight))
-    
-    # 6. Smart Rotation: Force Landscape
-    if flat_img.shape[0] > flat_img.shape[1]:
-        print("[5] Portrait orientation detected: Rotating to Landscape.")
-        flat_img = cv2.rotate(flat_img, cv2.ROTATE_90_CLOCKWISE)
-        
-    # 7. Add 100px pure white padding
-    print("[6] Adding 100px padding...")
-    padding = 100
-    final_padded = cv2.copyMakeBorder(
-        flat_img, padding, padding, padding, padding, 
-        cv2.BORDER_CONSTANT, value=[0, 0, 0, 0]
-    )
-    
-    cv2.imwrite(final_output_path, final_padded)
-    print(f"[+] Success! Final padded image saved to: {final_output_path}")
+    session = get_rembg_session()
+    # Create a tiny 10x10 dummy image to force numba JIT compilation
+    dummy = Image.new("RGB", (10, 10), color="white")
+    remove(dummy, session=session)
     return True
 
-
-def process_document(input_file, final_output_file):
+def sort_corners(pts):
     """
-    Bridge function: The camera GUI calls this function.
-    It automatically handles the temporary files and runs your pipeline.
+    Sorts 4 corner points into strict order:
+    [Top-Left, Top-Right, Bottom-Right, Bottom-Left]
+    Prevents diagonal scrambling using the Sum and Difference method.
     """
-    print(f"\n--- Starting Vision Pipeline for {input_file} ---")
-    temp_file = "temp_nobg.png"
-    
-    try:
-        # Step 1: Run your background removal
-        remove_background(input_file, temp_file)
-        
-        # Step 2: Run your math, rotation, and padding
-        success = straighten_and_pad(temp_file, final_output_file)
-        
-        # Step 3: Clean up the temporary file so it doesn't clutter your folder
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-            print("[7] Temporary files cleaned up.")
-            
-        return success
-        
-    except Exception as e:
-        print(f"[-] Fatal error in vision pipeline: {e}")
-        return False
+    pts = pts.reshape((4, 2))
+    rect = np.zeros((4, 2), dtype="float32")
 
-# ==========================================
-# MAIN EXECUTION
-# ==========================================
-if __name__ == "__main__":
-    RAW_IMAGE = "test_capture_2.png"    
-    TEMP_IMAGE = "testingoutcomes/raw/temp_nobg.png"         
-    FINAL_IMAGE = "testingoutcomes/processed/final_padded.jpg"     
+    # Sum Method: Top-Left has smallest sum, Bottom-Right has largest sum
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]  # Top-Left
+    rect[2] = pts[np.argmax(s)]  # Bottom-Right
+
+    # Difference Method: Top-Right has smallest diff (y - x), Bottom-Left has largest diff
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]  # Top-Right
+    rect[3] = pts[np.argmax(diff)]  # Bottom-Left
+
+    return rect
+
+def process_document(input_path, output_path):
+    """
+    Executes the full sequentially ordered vision processing pipeline.
     
-    if os.path.exists(RAW_IMAGE):
-        remove_background(RAW_IMAGE, TEMP_IMAGE)
-        straighten_and_pad(TEMP_IMAGE, FINAL_IMAGE)
+    Parameters:
+        input_path (str): File path of raw captured image.
+        output_path (str): File path to save final processed .png document.
+    """
+    # -------------------------------------------------------------------------
+    # STEP 1: AI Background Removal
+    # -------------------------------------------------------------------------
+    session = get_rembg_session()
+    input_img = Image.open(input_path)
+    
+    # Strip background to leave document on transparent alpha channel
+    output_png = remove(input_img, session=session)
+    img_np = np.array(output_png)
+
+    # Extract Alpha Channel to locate document outline
+    if img_np.shape[2] == 4:
+        alpha = img_np[:, :, 3]
     else:
-        print(f"[-] Error: Could not find '{RAW_IMAGE}'.")
+        alpha = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+
+    # -------------------------------------------------------------------------
+    # STEP 2: Contour & Corner Detection
+    # -------------------------------------------------------------------------
+    contours, _ = cv2.findContours(alpha, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("No document contour detected after background removal.")
+
+    largest_contour = max(contours, key=cv2.contourArea)
+    peri = cv2.arcLength(largest_contour, True)
+    approx = cv2.approxPolyDP(largest_contour, 0.02 * peri, True)
+
+    # Fallback to minimum area bounding box if 4 distinct corners are not found
+    if len(approx) == 4:
+        doc_pts = approx.reshape(4, 2)
+    else:
+        rect = cv2.minAreaRect(largest_contour)
+        doc_pts = cv2.boxPoints(rect)
+
+    # -------------------------------------------------------------------------
+    # STEP 3: Bulletproof Corner Sorting
+    # -------------------------------------------------------------------------
+    rect_corners = sort_corners(doc_pts)
+    (tl, tr, br, bl) = rect_corners
+
+    # -------------------------------------------------------------------------
+    # STEP 4: Perspective Transformation
+    # -------------------------------------------------------------------------
+    # Calculate output rectangle width
+    width_a = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+    width_b = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+    max_width = max(int(width_a), int(width_b))
+
+    # Calculate output rectangle height
+    height_a = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+    height_b = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+    max_height = max(int(height_a), int(height_b))
+
+    # Flat destination coordinates
+    dst = np.array([
+        [0, 0],
+        [max_width - 1, 0],
+        [max_width - 1, max_height - 1],
+        [0, max_height - 1]
+    ], dtype="float32")
+
+    # Map skewed physical corners to perfectly flat rectangle
+    M = cv2.getPerspectiveTransform(rect_corners, dst)
+    warped = cv2.warpPerspective(img_np, M, (max_width, max_height))
+
+    # -------------------------------------------------------------------------
+    # STEP 5: Smart Rotation & Transparent Padding
+    # -------------------------------------------------------------------------
+    h, w = warped.shape[:2]
+    # Force output image into landscape orientation
+    if h > w:
+        warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
+
+    # Add 100px completely transparent border ([0, 0, 0, 0] RGBA)
+    padded = cv2.copyMakeBorder(
+        warped, 
+        top=100, bottom=100, left=100, right=100, 
+        borderType=cv2.BORDER_CONSTANT, 
+        value=[0, 0, 0, 0]
+    )
+
+    # Save final PNG output
+    final_pil = Image.fromarray(padded)
+    final_pil.save(output_path, "PNG")
+    return True
