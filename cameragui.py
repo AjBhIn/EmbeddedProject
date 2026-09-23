@@ -4,7 +4,7 @@ DocuNode Control Panel GUI (cameragui.py)
 CustomTkinter interface featuring a 2-row layout:
 - Row 0: Live camera feed display using lightweight ImageTk
 - Row 1: Simplified live status badges (Focus, Size, Stability), 
-         status advice banner, and control buttons.
+         dashboard link, status advice banner, and state-locked buttons.
 
 Includes background pre-loading of imageeditor.py to ensure zero lag.
 """
@@ -14,6 +14,12 @@ import threading
 import cv2
 import customtkinter as ctk
 from PIL import Image, ImageTk
+import webbrowser
+import socket
+
+# Local System Imports
+import dashboard
+import db_manager
 
 # --- Sense HAT Hardware Import (Graceful Fallback) ---
 try:
@@ -27,27 +33,11 @@ except ImportError:
 
 # =============================================================================
 # THRESHOLD CALIBRATION & CONFIGURATION SETTINGS
-# Adjust these constants to tune system sensitivity on the Raspberry Pi
 # =============================================================================
-
-# 1. Focus Threshold (Variance of Laplacian)
-# Higher value = requires sharper focus. Lower = more forgiving with soft lenses.
 FOCUS_THRESHOLD = 100.0  
-
-# 2. Framing/Size Area Ratio
-# Minimum percentage of the total camera frame that the document contour must occupy (0.15 = 15%).
 MIN_DOC_AREA_RATIO = 0.15  
-
-# 3. Motion/Stability Threshold (Accelerometer Delta)
-# Polled from Sense HAT. Lower value = requires desk to be completely still. Higher = allows minor vibrations.
 STABILITY_THRESHOLD = 0.05  
-
-# 4. Watchdog Timer (WDT) Timeout (in seconds)
-# Maximum allowed scan time before triggering setup advice to the user on the UI/LED matrix[cite: 1].
 WDT_TIMEOUT = 10.0  
-
-# 5. Continuous Stability Lock Duration (in seconds)
-# How long all 3 conditions (Focus, Size, Motion) must continuously pass before auto-triggering capture.
 AUTO_CAPTURE_DELAY = 1.5  
 
 # =============================================================================
@@ -64,23 +54,39 @@ scan_start_time = 0
 good_frame_start_time = 0
 last_accel = {'x': 0, 'y': 0, 'z': 0}
 
-# Configure CustomTkinter appearance
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def get_local_ip():
+    """Finds the local IP address of the Raspberry Pi."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+def start_dashboard_background():
+    """Launches Flask web dashboard background thread."""
+    t = threading.Thread(target=dashboard.start_server, daemon=True)
+    t.start()
 
 # =============================================================================
 # LIVE FEED VALIDATION FUNCTIONS ("THE BOUNCER")
 # =============================================================================
 
 def check_focus(frame, threshold=FOCUS_THRESHOLD):
-    """Calculates image sharpness using OpenCV Variance of the Laplacian."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     focus_score = cv2.Laplacian(gray, cv2.CV_64F).var()
-    # Comparison against mathematical FOCUS_THRESHOLD
     return focus_score >= threshold
 
 def check_framing(frame, min_area_ratio=MIN_DOC_AREA_RATIO):
-    """Checks if a document contour occupies sufficient frame area."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blurred, 50, 150)
@@ -94,11 +100,9 @@ def check_framing(frame, min_area_ratio=MIN_DOC_AREA_RATIO):
     frame_area = frame.shape[0] * frame.shape[1]
     
     area_ratio = doc_area / frame_area
-    # Comparison against mathematical MIN_DOC_AREA_RATIO
     return area_ratio >= min_area_ratio
 
 def check_stability(threshold=STABILITY_THRESHOLD):
-    """Polls Sense HAT accelerometer to verify table isn't shaking[cite: 1]."""
     global last_accel
     if not SENSE_AVAILABLE:
         return True
@@ -110,7 +114,6 @@ def check_stability(threshold=STABILITY_THRESHOLD):
     movement = dx + dy + dz
     
     last_accel = accel
-    # Comparison against mathematical STABILITY_THRESHOLD
     return movement < threshold
 
 # =============================================================================
@@ -118,7 +121,6 @@ def check_stability(threshold=STABILITY_THRESHOLD):
 # =============================================================================
 
 def start_engine_preload_thread(advice_lbl, root_window):
-    """Launches a silent background thread to warm up numba/rembg on startup."""
     def worker():
         global engine_ready
         try:
@@ -130,54 +132,69 @@ def start_engine_preload_thread(advice_lbl, root_window):
             ))
         except Exception as e:
             print(f"Preload warning: {e}")
-            engine_ready = True  # Proceed anyway
+            engine_ready = True
 
     threading.Thread(target=worker, daemon=True).start()
 
-def action_process_image(advice_lbl, root_window):
-    """Launches imageeditor processing thread without locking the GUI[cite: 1]."""
+def action_process_image(advice_lbl, root_window, btn_force, btn_retry, btn_process):
+    """Safety Control: Locks all controls during background execution."""
     global app_state, photo_count
     
     app_state = "PROCESSING"
     advice_lbl.configure(text="Processing image with rembg pipeline... Please wait.", text_color="#2196F3")
+    
+    # Disable ALL action buttons to ensure system safety
+    btn_force.configure(state="disabled", fg_color="#374151")
+    btn_retry.configure(state="disabled", fg_color="#374151")
+    btn_process.configure(state="disabled", fg_color="#374151")
     
     input_file = f"raw_capture_{photo_count}.png"
     output_file = f"processed_doc_{photo_count}.png"
     
     threading.Thread(
         target=run_vision_pipeline_thread, 
-        args=(input_file, output_file, advice_lbl, root_window), 
+        args=(input_file, output_file, advice_lbl, root_window, btn_force, btn_retry, btn_process), 
         daemon=True
     ).start()
 
-def run_vision_pipeline_thread(input_path, output_path, advice_lbl, root_window):
-    """Executes imageeditor.py tasks and updates UI safely via root.after()."""
+def run_vision_pipeline_thread(input_path, output_path, advice_lbl, root_window, btn_force, btn_retry, btn_process):
+    """Executes imageeditor.py tasks, logs to SQLite, and auto-resets back to live camera mode."""
     try:
         import imageeditor
+        
+        # 1. Initialize DB if required[cite: 1]
+        db_manager.init_db()
+        
+        # 2. Run vision pipeline
         imageeditor.process_document(input_path, output_path)
         
-        # Safe thread transition back to main GUI thread
+        # 3. Log record in SQLite[cite: 1]
+        record_id = db_manager.log_scan(input_path, output_path, status="COMPLETED")
+        
+        # 4. Notify UI of success
         root_window.after(0, lambda: advice_lbl.configure(
-            text=f"Success! Processed scan saved to {output_path}", text_color="#4CAF50"
+            text=f"Success! Record #{record_id} saved. Resetting to live feed...", text_color="#4CAF50"
         ))
     except Exception as e:
         root_window.after(0, lambda: advice_lbl.configure(
             text=f"Pipeline Error: {str(e)}", text_color="#F44336"
         ))
+    finally:
+        # 5. Brief pause before automatically returning back to live feed mode
+        time.sleep(1.5)
+        root_window.after(0, lambda: action_retry_scan(advice_lbl, btn_force, btn_retry, btn_process))
 
 # =============================================================================
 # APPLICATION CONTROLS & STATE MANAGEMENT
 # =============================================================================
 
 def init_camera():
-    """Initializes OpenCV video stream."""
     global cap
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: Camera device could not be opened.")
 
-def update_video_feed(video_label, focus_lbl, frame_lbl, stable_lbl, advice_lbl, btn_process, btn_retry):
-    """Main feed loop handling live validation, state transitions, and rendering."""
+def update_video_feed(video_label, focus_lbl, frame_lbl, stable_lbl, advice_lbl, btn_force, btn_retry, btn_process):
     global cap, current_frame, captured_frame, app_state
     global scan_start_time, good_frame_start_time
     
@@ -185,16 +202,13 @@ def update_video_feed(video_label, focus_lbl, frame_lbl, stable_lbl, advice_lbl,
         ret, frame = cap.read()
         
         if ret:
-            # 1. LIVE FEED SCANNING STATE
             if app_state == "LIVE":
                 current_frame = frame.copy()
                 
-                # Perform live metric checks (Returns purely Booleans)
                 is_focused = check_focus(frame)
                 is_framed = check_framing(frame)
                 is_stable = check_stability()
                 
-                # Update live metric status badges with clean text labels
                 focus_lbl.configure(
                     text="Focus: OK" if is_focused else "Focus: BLUR",
                     fg_color="#1E3A1E" if is_focused else "#3A1E1E",
@@ -213,7 +227,6 @@ def update_video_feed(video_label, focus_lbl, frame_lbl, stable_lbl, advice_lbl,
                     text_color="#4CAF50" if is_stable else "#F44336"
                 )
                 
-                # Watchdog Timer & Auto-Capture Decision Logic
                 current_time = time.time()
                 if (current_time - scan_start_time) > WDT_TIMEOUT:
                     advice_lbl.configure(
@@ -237,12 +250,9 @@ def update_video_feed(video_label, focus_lbl, frame_lbl, stable_lbl, advice_lbl,
                             advice_lbl.configure(text="Advice: Desk movement detected. Hold still.", text_color="#D1D5DB")
 
                 display_frame = current_frame
-
-            # 2. REVIEW & PROCESSING STATE (Displays static captured photo)
             else:
                 display_frame = captured_frame if captured_frame is not None else frame
 
-            # Render frame using standard ImageTk (High performance on Raspberry Pi)
             cv2_img = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(cv2_img)
             pil_img = pil_img.resize((640, 360), Image.Resampling.NEAREST)
@@ -251,11 +261,9 @@ def update_video_feed(video_label, focus_lbl, frame_lbl, stable_lbl, advice_lbl,
             video_label.tk_image = tk_img
             video_label.configure(image=tk_img)
 
-    # Schedule next loop pass (~30 FPS execution) using local parameter names
-    video_label.after(30, update_video_feed, video_label, focus_lbl, frame_lbl, stable_lbl, advice_lbl, btn_process, btn_retry)
+    video_label.after(30, update_video_feed, video_label, focus_lbl, frame_lbl, stable_lbl, advice_lbl, btn_force, btn_retry, btn_process)
     
 def trigger_review_mode(advice_lbl, btn_process, btn_retry):
-    """Freezes live feed and saves initial raw capture."""
     global app_state, current_frame, captured_frame, photo_count
     
     app_state = "REVIEW"
@@ -266,15 +274,14 @@ def trigger_review_mode(advice_lbl, btn_process, btn_retry):
     cv2.imwrite(filename, captured_frame)
     
     advice_lbl.configure(text=f"Frame captured as {filename}. Ready to process?", text_color="#4CAF50")
-    btn_process.configure(state="normal", fg_color="#2EA043")
+    btn_process.configure(state="normal", fg_color="#166534")
     btn_retry.configure(state="normal", fg_color="#D97706")
 
 def action_force_capture(advice_lbl, btn_process, btn_retry):
-    """Manual button override for developer testing."""
     trigger_review_mode(advice_lbl, btn_process, btn_retry)
 
-def action_retry_scan(advice_lbl, btn_process, btn_retry):
-    """Resets interface back to live feed mode."""
+def action_retry_scan(advice_lbl, btn_force, btn_retry, btn_process):
+    """Resets interface back to live feed mode and restores initial button states."""
     global app_state, scan_start_time, good_frame_start_time
     
     app_state = "LIVE"
@@ -282,60 +289,61 @@ def action_retry_scan(advice_lbl, btn_process, btn_retry):
     good_frame_start_time = 0
     
     advice_lbl.configure(text="Scanning live stream...", text_color="#D1D5DB")
-    btn_process.configure(state="disabled", fg_color="#374151")
+    btn_force.configure(state="normal", fg_color="#2563EB")
     btn_retry.configure(state="disabled", fg_color="#374151")
+    btn_process.configure(state="disabled", fg_color="#374151")
 
 def cleanup(root):
-    """Cleanly releases hardware camera resources on application shutdown."""
     global cap
     if cap is not None:
         cap.release()
     root.destroy()
 
 # =============================================================================
-# MAIN WINDOW GUI LAYOUT (2-ROW GRID)
+# MAIN WINDOW GUI LAYOUT
 # =============================================================================
 
 def main():
     global scan_start_time
+    
+    # Init DB & Web Dashboard Thread[cite: 1]
+    db_manager.init_db()
+    start_dashboard_background()
+    
     init_camera()
     scan_start_time = time.time()
     
     root = ctk.CTk()
     root.title("DocuNode Edge Appliance - Control Panel")
-    root.geometry("820x680")
+    root.geometry("820x720")
     root.resizable(False, False)
 
-    # 2-Row Grid Setup
-    root.grid_rowconfigure(0, weight=3)  # Row 0: Camera Feed Panel
-    root.grid_rowconfigure(1, weight=2)  # Row 1: Controls & Metrics Panel
+    root.grid_rowconfigure(0, weight=3)  # Row 0: Camera Feed
+    root.grid_rowconfigure(1, weight=2)  # Row 1: Controls & Metrics
     root.grid_columnconfigure(0, weight=1)
 
-    # -------------------------------------------------------------------------
     # ROW 0: VIDEO DISPLAY FRAME
-    # -------------------------------------------------------------------------
     video_frame = ctk.CTkFrame(root, corner_radius=12, fg_color="#1F2937")
-    video_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="nsew")
+    video_frame.grid(row=0, column=0, padx=20, pady=(15, 5), sticky="nsew")
     video_frame.grid_columnconfigure(0, weight=1)
     video_frame.grid_rowconfigure(0, weight=1)
 
     video_label = ctk.CTkLabel(video_frame, text="", corner_radius=8)
     video_label.grid(row=0, column=0, padx=10, pady=10)
 
-    # -------------------------------------------------------------------------
     # ROW 1: CONTROLS & METRICS PANEL
-    # -------------------------------------------------------------------------
     controls_panel = ctk.CTkFrame(root, corner_radius=12, fg_color="#111827")
-    controls_panel.grid(row=1, column=0, padx=20, pady=(10, 20), sticky="nsew")
+    controls_panel.grid(row=1, column=0, padx=20, pady=(5, 15), sticky="nsew")
     
     controls_panel.grid_rowconfigure(0, weight=1)  # Metric Badges Sub-row
-    controls_panel.grid_rowconfigure(1, weight=1)  # Status Advice Banner Sub-row
-    controls_panel.grid_rowconfigure(2, weight=1)  # Action Buttons Sub-row
+    controls_panel.grid_rowconfigure(1, weight=1)  # Dashboard Link Sub-row
+    controls_panel.grid_rowconfigure(2, weight=1)  # Advice Banner Sub-row
+    controls_panel.grid_rowconfigure(3, weight=1)  # Buttons Sub-row
     controls_panel.grid_columnconfigure(0, weight=1)
 
-    # --- Metric Badges Sub-Row ---
+    # Sub-Row 0: Metric Badges
     metrics_frame = ctk.CTkFrame(controls_panel, fg_color="transparent")
-    metrics_frame.grid(row=0, column=0, padx=15, pady=5, sticky="ew")
+    metrics_frame.grid(row=0, column=0, padx=15, pady=2, sticky="ew")
     metrics_frame.grid_columnconfigure((0, 1, 2), weight=1)
 
     focus_badge = ctk.CTkLabel(
@@ -356,16 +364,33 @@ def main():
     )
     stable_badge.grid(row=0, column=2, padx=5, sticky="ew")
 
-    # --- Status Advice Sub-Row ---
+    # Sub-Row 1: Web Dashboard URL Link
+    pi_ip = get_local_ip()
+    dash_url = f"http://{pi_ip}:5000"
+    
+    dash_frame = ctk.CTkFrame(controls_panel, fg_color="transparent")
+    dash_frame.grid(row=1, column=0, padx=15, pady=2)
+    
+    lbl_dash = ctk.CTkLabel(dash_frame, text="Web Dashboard: ", font=("Arial", 12, "bold"))
+    lbl_dash.pack(side="left")
+    
+    lbl_link = ctk.CTkLabel(
+        dash_frame, text=dash_url, font=("Arial", 12, "underline"),
+        text_color="#3B82F6", cursor="hand2"
+    )
+    lbl_link.pack(side="left")
+    lbl_link.bind("<Button-1>", lambda e: webbrowser.open(dash_url))
+
+    # Sub-Row 2: Status Advice Banner
     advice_label = ctk.CTkLabel(
         controls_panel, text="Warming up processing engine...", 
         font=("Arial", 14, "italic"), text_color="#D1D5DB"
     )
-    advice_label.grid(row=1, column=0, padx=15, pady=5)
+    advice_label.grid(row=2, column=0, padx=15, pady=2)
 
-    # --- Action Buttons Sub-Row ---
+    # Sub-Row 3: Action Buttons
     buttons_frame = ctk.CTkFrame(controls_panel, fg_color="transparent")
-    buttons_frame.grid(row=2, column=0, padx=15, pady=(5, 15), sticky="ew")
+    buttons_frame.grid(row=3, column=0, padx=15, pady=(2, 10), sticky="ew")
     buttons_frame.grid_columnconfigure((0, 1, 2), weight=1)
 
     btn_force = ctk.CTkButton(
@@ -378,25 +403,21 @@ def main():
     btn_retry = ctk.CTkButton(
         buttons_frame, text="Retry Scan", font=("Arial", 14, "bold"),
         height=40, fg_color="#374151", hover_color="#4B5563", state="disabled",
-        command=lambda: action_retry_scan(advice_label, btn_process, btn_retry)
+        command=lambda: action_retry_scan(advice_label, btn_force, btn_retry, btn_process)
     )
     btn_retry.grid(row=0, column=1, padx=5, sticky="ew")
 
     btn_process = ctk.CTkButton(
         buttons_frame, text="Process Image", font=("Arial", 14, "bold"),
         height=40, fg_color="#374151", hover_color="#166534", state="disabled",
-        command=lambda: action_process_image(advice_label, root)
+        command=lambda: action_process_image(advice_label, root, btn_force, btn_retry, btn_process)
     )
     btn_process.grid(row=0, column=2, padx=5, sticky="ew")
 
-    # Bind application close handler
     root.protocol("WM_DELETE_WINDOW", lambda: cleanup(root))
 
-    # Kick off background pre-loader thread
     start_engine_preload_thread(advice_label, root)
-
-    # Kick off live video feed loop
-    update_video_feed(video_label, focus_badge, frame_badge, stable_badge, advice_label, btn_process, btn_retry)
+    update_video_feed(video_label, focus_badge, frame_badge, stable_badge, advice_label, btn_force, btn_retry, btn_process)
 
     root.mainloop()
 
