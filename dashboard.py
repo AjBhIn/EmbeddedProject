@@ -13,7 +13,7 @@ import sys
 app = Flask(__name__)
 DB_NAME = "docunode.db"
 
-# HTML Template with styling and direct download buttons
+# Web Page
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -67,6 +67,7 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# Connecting to SQL Database
 def fetch_scans():
     """Reads scan logs from SQLite[cite: 3]."""
     if not os.path.exists(DB_NAME):
@@ -82,11 +83,13 @@ def fetch_scans():
         print(f"[DB Error] {e}")
         return []
 
+# Putting the image captured into the webpage, by storing it in scans array
 @app.route("/")
 def index():
     scans = fetch_scans()
     return render_template_string(HTML_TEMPLATE, scans=scans)
 
+# Connecting the download button to SQL database to download that image
 @app.route("/download/<int:record_id>")
 def download(record_id):
     conn = sqlite3.connect(DB_NAME)

@@ -32,10 +32,10 @@ except ImportError:
     sense = None
 
 # =============================================================================
-# THRESHOLD CALIBRATION & CONFIGURATION SETTINGS
+# SETTINGS
 # =============================================================================
 FOCUS_THRESHOLD = 100.0  
-MIN_DOC_AREA_RATIO = 0.15  
+MIN_DOC_AREA_RATIO = 0.05  
 STABILITY_THRESHOLD = 0.05  
 WDT_TIMEOUT = 10.0  
 AUTO_CAPTURE_DELAY = 1.5  
@@ -73,7 +73,7 @@ def get_local_ip():
         return "127.0.0.1"
 
 def start_dashboard_background():
-    """Launches Flask web dashboard background thread."""
+    """Launches Flask web dashboard background (daemon) thread."""
     t = threading.Thread(target=dashboard.start_server, daemon=True)
     t.start()
 
@@ -87,11 +87,20 @@ def check_focus(frame, threshold=FOCUS_THRESHOLD):
     return focus_score >= threshold
 
 def check_framing(frame, min_area_ratio=MIN_DOC_AREA_RATIO):
+    """Checks if a document contour occupies sufficient frame area with noise smoothing."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
     
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 1. Stronger blur to wash out desk texture and printed text
+    blurred = cv2.GaussianBlur(gray, (15, 15), 0)
+    
+    # 2. More forgiving edge detection
+    edges = cv2.Canny(blurred, 30, 120)
+    
+    # 3. Morphological Closing: Thickens edges to bridge gaps and create a solid shape
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    closed_edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+    
+    contours, _ = cv2.findContours(closed_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return False
         
@@ -162,13 +171,13 @@ def run_vision_pipeline_thread(input_path, output_path, advice_lbl, root_window,
     try:
         import imageeditor
         
-        # 1. Initialize DB if required[cite: 1]
+        # 1. Initialize DB if required
         db_manager.init_db()
         
-        # 2. Run vision pipeline
+        # 2. Passing in the raw image to imageeditor file to take care
         imageeditor.process_document(input_path, output_path)
         
-        # 3. Log record in SQLite[cite: 1]
+        # 3. Log record in SQLite
         record_id = db_manager.log_scan(input_path, output_path, status="COMPLETED")
         
         # 4. Notify UI of success
@@ -202,7 +211,7 @@ def update_video_feed(video_label, focus_lbl, frame_lbl, stable_lbl, advice_lbl,
         ret, frame = cap.read()
         
         if ret:
-            if app_state == "LIVE":
+            if app_state == "LIVE": # Meaning it is in the state of recording
                 current_frame = frame.copy()
                 
                 is_focused = check_focus(frame)

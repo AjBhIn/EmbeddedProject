@@ -10,6 +10,7 @@ import os
 
 DB_NAME = "docunode.db"
 
+# Creating SQL table
 def init_db():
     """Creates the SQLite database file and scans table if they don't exist."""
     conn = sqlite3.connect(DB_NAME)
@@ -30,6 +31,7 @@ def init_db():
     conn.close()
     print(f"[DB] Database '{DB_NAME}' initialized successfully.")
 
+# Putting the Image into the table
 def log_scan(raw_path, processed_path, status="COMPLETED"):
     """Inserts a new scan record into the database[cite: 3]."""
     try:
@@ -51,6 +53,7 @@ def log_scan(raw_path, processed_path, status="COMPLETED"):
         print(f"[DB Error] Failed to log scan: {e}")
         return None
 
+# Getting the data
 def fetch_all_scans():
     """Retrieves all logged document records from the database[cite: 3]."""
     conn = sqlite3.connect(DB_NAME)
@@ -62,7 +65,7 @@ def fetch_all_scans():
     conn.close()
     return rows
 
-# Quick test when running this file directly
+# Quick test when running this file by itself
 if __name__ == "__main__":
     init_db()
     log_scan("raw_capture_1.png", "processed_doc_1.png")
