@@ -2,11 +2,11 @@
 DocuNode Vision Pipeline Module (imageeditor.py)
 ------------------------------------------------
 Handles edge-computed perspective scanning steps:
-1. AI Background Removal (rembg / u2netp model)
-2. Contour & Corner Detection (OpenCV)
-3. Corner Sorting (Sum and Difference Method)
-4. Perspective Transformation (Warp Matrix)
-5. Landscape Rotation & 100px Alpha Padding
+- AI Background Removal (rembg / u2netp model)
+- Contour & Corner Detection (OpenCV)
+- Corner Sorting (Sum and Difference Method)
+- Perspective Transformation (Warp Matrix)
+- Landscape Rotation & 100px Alpha Padding
 """
 
 import cv2
@@ -31,7 +31,7 @@ def preload_engine():
     Call this on application startup in a background thread.
     """
     session = get_rembg_session()
-    # Create a tiny 10x10 dummy image to force numba JIT compilation
+    # Create a tiny 10x10 dummy image to force numba JIT compilation : To Fool the rembg
     dummy = Image.new("RGB", (10, 10), color="white")
     remove(dummy, session=session)
     return True
@@ -66,7 +66,7 @@ def process_document(input_path, output_path):
         output_path (str): File path to save final processed .png document.
     """
     # -------------------------------------------------------------------------
-    # STEP 1: AI Background Removal
+    # AI Background Removal
     # -------------------------------------------------------------------------
     session = get_rembg_session()
     input_img = Image.open(input_path)
@@ -82,7 +82,7 @@ def process_document(input_path, output_path):
         alpha = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
 
     # -------------------------------------------------------------------------
-    # STEP 2: Contour & Corner Detection
+    # Contour & Corner Detection
     # -------------------------------------------------------------------------
     contours, _ = cv2.findContours(alpha, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -100,13 +100,13 @@ def process_document(input_path, output_path):
         doc_pts = cv2.boxPoints(rect)
 
     # -------------------------------------------------------------------------
-    # STEP 3: Bulletproof Corner Sorting
+    # Corner Sorting
     # -------------------------------------------------------------------------
     rect_corners = sort_corners(doc_pts)
     (tl, tr, br, bl) = rect_corners
 
     # -------------------------------------------------------------------------
-    # STEP 4: Perspective Transformation
+    # Perspective Transformation
     # -------------------------------------------------------------------------
     # Calculate output rectangle width
     width_a = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
@@ -131,13 +131,14 @@ def process_document(input_path, output_path):
     warped = cv2.warpPerspective(img_np, M, (max_width, max_height))
 
     # -------------------------------------------------------------------------
-    # STEP 5: Smart Rotation & Transparent Padding
+    # Auto Rotation & Transparent Padding
     # -------------------------------------------------------------------------
     h, w = warped.shape[:2]
     # Force output image into landscape orientation
     if h > w:
         warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
 
+    # Padding Adder
     # Add 100px completely transparent border ([0, 0, 0, 0] RGBA)
     padded = cv2.copyMakeBorder(
         warped, 
